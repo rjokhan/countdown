@@ -1,6 +1,6 @@
 # countdown_bot.py — PTB 21.6, asyncio task (без JobQueue)
-# Кнопка-таймер: "DD kun • HH soat • MM daqiqa"
-# Обновление строго по минутам, текст сообщения не меняется (только кнопка).
+# Доступ только для ALLOWED_IDS. Кнопка-таймер: "DD kun, HH:MM".
+# Обновление по минутам, меняется только кнопка.
 
 import os
 import re
@@ -18,7 +18,14 @@ from telegram.ext import (
     ConversationHandler, MessageHandler, CallbackQueryHandler, filters
 )
 
-# ---------- ЛОГИ ----------
+# ---------- доступ ----------
+ALLOWED_IDS = {5790925357, 1407015589, 573761807}
+
+def is_allowed(update: Update) -> bool:
+    u = update.effective_user
+    return bool(u and u.id in ALLOWED_IDS)
+
+# ---------- логирование ----------
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 log = logging.getLogger("countdown")
 
@@ -33,7 +40,7 @@ TEXT, DEADLINE, CHANNEL, LINK, CONFIRM = range(5)
 # Активные фоновые задачи: (chat_id, message_id) -> asyncio.Task
 TASKS: dict[tuple[int, int], asyncio.Task] = {}
 
-# ---------- УТИЛИТЫ ----------
+# ---------- утилиты ----------
 def parse_deadline(s: str) -> datetime:
     s = s.strip()
     fmts = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"]
@@ -46,13 +53,11 @@ def parse_deadline(s: str) -> datetime:
     raise ValueError("Неверный формат. Пример: 2025-09-30 23:59 (или 2025-09-30 23:59:00)")
 
 def fmt_dd_hh_mm(delta: timedelta) -> str:
-    # округляем вниз до минут
     total = int(max(0, delta.total_seconds()))
     total -= total % 60
     d, r = divmod(total, 86400)
     h, r = divmod(r, 3600)
     m = r // 60
-    # визуально приятный вид
     return f"{d:02d} kun, {h:02d}:{m:02d}"
 
 def normalize_link(s: str | None) -> str | None:
@@ -64,30 +69,22 @@ def normalize_link(s: str | None) -> str | None:
     return s.strip()
 
 def make_keyboard(label: str, url: str | None) -> InlineKeyboardMarkup:
-    # только кнопка; текст сообщения не трогаем
     if url:
         btn = InlineKeyboardButton(f"⏳ {label}", url=url)
     else:
         btn = InlineKeyboardButton(f"⏳ {label}", callback_data="noop")
     return InlineKeyboardMarkup([[btn]])
 
-# ---------- ФОНОВАЯ КОРУТИНА ОБНОВЛЕНИЯ ПО МИНУТАМ ----------
+# ---------- фон: минутные апдейты ----------
 async def ticker(bot, chat_id: int, message_id: int, deadline: datetime, url: str | None):
-    """
-    Обновляет ИСКЛЮЧИТЕЛЬНО клавиатуру раз в минуту, синхронизируясь к началу минуты.
-    Останавливается по дедлайну или при /stop.
-    """
     key = (chat_id, message_id)
     try:
         while True:
             now = datetime.now(tz=TZ)
             left = deadline - now
             if left.total_seconds() <= 0:
-                # финал: заменяем весь текст и убираем кнопку
                 try:
-                    await bot.edit_message_text(
-                        chat_id=chat_id, message_id=message_id, text="✅ Aktsiya yakunlandi!"
-                    )
+                    await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="✅ Aktsiya yakunlandi!")
                 except Exception as e:
                     log.warning("final edit failed: %r", e)
                 break
@@ -95,13 +92,10 @@ async def ticker(bot, chat_id: int, message_id: int, deadline: datetime, url: st
             label = fmt_dd_hh_mm(left)
             kb = make_keyboard(label, url)
             try:
-                await bot.edit_message_reply_markup(
-                    chat_id=chat_id, message_id=message_id, reply_markup=kb
-                )
+                await bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=kb)
             except RetryAfter as e:
                 await asyncio.sleep(e.retry_after)
             except BadRequest as e:
-                # message is not modified / rights / etc.
                 if "message is not modified" not in str(e).lower():
                     log.error("BadRequest: %r", e)
             except (TimedOut, NetworkError) as e:
@@ -109,43 +103,45 @@ async def ticker(bot, chat_id: int, message_id: int, deadline: datetime, url: st
             except Exception as e:
                 log.exception("Unexpected edit error: %r", e)
 
-            # спим до начала следующей минуты (устойчиво к дрейфу)
             now2 = datetime.now(tz=TZ)
             sleep_sec = 60 - now2.second
             await asyncio.sleep(sleep_sec)
-
     except asyncio.CancelledError:
         log.info("ticker cancelled for %s", key)
         raise
     finally:
         TASKS.pop(key, None)
 
-# ---------- ДИАЛОГ ----------
+# ---------- диалог ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await context.application.bot.set_my_commands([
-        ("start", "Запустить мастер таймера"),
-        ("stop", "Остановить все таймеры")
-    ])
-    await update.message.reply_text(
-        "1) Заголовок сообщения (то, что будет над кнопкой).",
-        parse_mode=ParseMode.HTML
-    )
+    if not is_allowed(update):
+        await update.message.reply_text("Access denied.")
+        return ConversationHandler.END
+    await context.application.bot.set_my_commands([("start", "Запустить мастер таймера"), ("stop", "Остановить все таймеры")])
+    await update.message.reply_text("1) Заголовок сообщения (то, что будет над кнопкой).", parse_mode=ParseMode.HTML)
     return TEXT
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return ConversationHandler.END
     await update.message.reply_text("Отменено.")
     return ConversationHandler.END
 
 async def ask_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        await update.message.reply_text("Access denied.")
+        return ConversationHandler.END
     context.user_data["text"] = update.message.text.strip()
     await update.message.reply_text(
-        f"2) Дата/время окончания: <b>YYYY-MM-DD HH:MM</b> (таймзона: <b>{TZ_NAME}</b>)\n"
-        f"Пример: <code>2025-09-30 23:59</code>",
-        parse_mode=ParseMode.HTML
+        f"2) Дата/время окончания: <b>YYYY-MM-DD HH:MM</b> (таймзона: <b>{TZ_NAME}</b>)\nПример: <code>2025-09-30 23:59</code>",
+        parse_mode=ParseMode.HTML,
     )
     return DEADLINE
 
 async def ask_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        await update.message.reply_text("Access denied.")
+        return ConversationHandler.END
     try:
         dt = parse_deadline(update.message.text)
     except Exception as e:
@@ -153,25 +149,25 @@ async def ask_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if dt <= datetime.now(tz=TZ):
         await update.message.reply_text("Время уже прошло. Укажите будущую дату/время."); return DEADLINE
     context.user_data["deadline"] = dt
-    await update.message.reply_text(
-        "3) Канал: @channel_username или ID -100xxxxxxxxxx.\n"
-        "Бот должен быть админом с правом редактировать сообщения."
-    )
+    await update.message.reply_text("3) Канал: @channel_username или ID -100xxxxxxxxxx.\nБот должен быть админом с правом редактировать сообщения.")
     return CHANNEL
 
 async def ask_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        await update.message.reply_text("Access denied.")
+        return ConversationHandler.END
     ch = update.message.text.strip()
     if not (ch.startswith("@") or ch.startswith("-100")):
         await update.message.reply_text("Неверный формат. Пример: @your_channel или -1001234567890")
         return CHANNEL
     context.user_data["channel"] = ch
-    await update.message.reply_text(
-        "4) Ссылка для кнопки (URL). Если не нужна — отправьте: <code>null</code> или <code>-</code>.",
-        parse_mode=ParseMode.HTML
-    )
+    await update.message.reply_text("4) Ссылка для кнопки (URL). Если не нужна — отправьте: <code>null</code> или <code>-</code>.", parse_mode=ParseMode.HTML)
     return LINK
 
 async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        await update.message.reply_text("Access denied.")
+        return ConversationHandler.END
     link = normalize_link(update.message.text)
     context.user_data["link"] = link
 
@@ -187,14 +183,16 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Ссылка: {link or '— нет —'}\n\n"
         "Нажмите «Отправить»."
     )
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Отправить", callback_data="confirm_send"),
-         InlineKeyboardButton("❌ Отмена", callback_data="confirm_cancel")]
-    ])
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Отправить", callback_data="confirm_send"),
+                                InlineKeyboardButton("❌ Отмена", callback_data="confirm_cancel")]])
     await update.message.reply_text(preview, parse_mode=ParseMode.HTML, reply_markup=kb)
     return CONFIRM
 
 async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        await update.callback_query.answer("Access denied.", show_alert=True)
+        return ConversationHandler.END
+
     query = update.callback_query
     await query.answer()
 
@@ -208,16 +206,10 @@ async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     channel = data["channel"]
     url: str | None = data["link"]
 
-    # рассчитываем первую подпись (без секунд)
     first_label = fmt_dd_hh_mm(deadline - datetime.now(tz=TZ))
-
-    # публикуем сообщение с кнопкой сразу с правильной подписью
     try:
         msg = await context.bot.send_message(
-            chat_id=channel,
-            text=header,  # таймер в тексте не дублируем
-            reply_markup=make_keyboard(first_label, url),
-            parse_mode=ParseMode.HTML
+            chat_id=channel, text=header, reply_markup=make_keyboard(first_label, url), parse_mode=ParseMode.HTML
         )
         log.info("Posted to %s (msg_id=%s)", channel, msg.message_id)
     except Exception as e:
@@ -227,7 +219,6 @@ async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.edit_message_text("Yuborildi. Taymer ishga tushdi.")
 
-    # запускаем фоновую корутину (минутные апдейты)
     key = (msg.chat.id, msg.message_id)
     task = context.application.create_task(
         ticker(context.bot, msg.chat.id, msg.message_id, deadline, url),
@@ -238,9 +229,15 @@ async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # no-op для кнопки без ссылки
 async def noop_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        await update.callback_query.answer("Access denied.", show_alert=True)
+        return
     await update.callback_query.answer("")
 
 async def stop_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        await update.message.reply_text("Access denied.")
+        return
     n = 0
     for key, task in list(TASKS.items()):
         if not task.done():
@@ -257,22 +254,23 @@ def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
+        entry_points=[CommandHandler("start", start, filters=filters.User(ALLOWED_IDS))],
         states={
-            TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_deadline)],
-            DEADLINE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_channel)],
-            CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_link)],
-            LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm)],
+            TEXT: [MessageHandler(filters.User(ALLOWED_IDS) & filters.TEXT & ~filters.COMMAND, ask_deadline)],
+            DEADLINE: [MessageHandler(filters.User(ALLOWED_IDS) & filters.TEXT & ~filters.COMMAND, ask_channel)],
+            CHANNEL: [MessageHandler(filters.User(ALLOWED_IDS) & filters.TEXT & ~filters.COMMAND, ask_link)],
+            LINK: [MessageHandler(filters.User(ALLOWED_IDS) & filters.TEXT & ~filters.COMMAND, confirm)],
+            # CallbackQueryHandler не поддерживает filters -> проверяем в on_confirm()
             CONFIRM: [CallbackQueryHandler(on_confirm, pattern="^confirm_(send|cancel)$")],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", cancel, filters=filters.User(ALLOWED_IDS))],
         per_chat=True,
         per_user=True,
     )
 
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(noop_cb, pattern="^noop$"))
-    app.add_handler(CommandHandler("stop", stop_all))
+    app.add_handler(CommandHandler("stop", stop_all, filters=filters.User(ALLOWED_IDS)))
 
     app.run_polling()
 
